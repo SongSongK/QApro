@@ -1,13 +1,14 @@
 "use client";
 
 import { useState, useRef, useEffect, useLayoutEffect } from "react";
-import throttle from "just-throttle";
+import { useDebouncedCallback } from "use-debounce";
+
+import Recomment from "./Recomment";
 import { IconButton } from "./button";
 import styles from "./home.module.scss";
 
 import SettingsIcon from "../icons/settings.svg";
 import GithubIcon from "../icons/github.svg";
-import StopIcon from "../icons/stop.svg";
 import SendWhiteIcon from "../icons/send-white.svg";
 import BrainIcon from "../icons/brain.svg";
 import ExportIcon from "../icons/export.svg";
@@ -18,25 +19,19 @@ import LoadingIcon from "../icons/three-dots.svg";
 import MenuIcon from "../icons/menu.svg";
 import CloseIcon from "../icons/close.svg";
 import CopyIcon from "../icons/copy.svg";
-import RefreshIcon from "../icons/refresh.svg";
 import DownloadIcon from "../icons/download.svg";
+import RefreshIcon from "../icons/refresh.svg";
+import StopIcon from "../icons/stop.svg";
 
 import { Message, SubmitKey, useChatStore, ChatSession } from "../store";
-import { showModal } from "./ui-lib";
+import { showModal, showToast } from "./ui-lib";
 import { copyToClipboard, downloadAs, isIOS, selectOrCopy } from "../utils";
 import Locale from "../locales";
 
 import dynamic from "next/dynamic";
-import {
-  REPO_URL,
-  PAY_URL,
-  CONTACT_URL,
-  QACHAT_OLD_URL,
-  AD_URL,
-} from "../constant";
+import { REPO_URL, PAY_URL, QACHAT_OLD_URL, AD_URL } from "../constant";
 import { ControllerPool } from "../requests";
-
-export type RenderMessage = Message & { preview?: boolean };
+import { Prompt, usePromptStore } from "../store/prompt";
 
 export function Loading(props: { noLogo?: boolean }) {
   return (
@@ -58,108 +53,6 @@ const Settings = dynamic(async () => (await import("./settings")).Settings, {
 const Emoji = dynamic(async () => (await import("emoji-picker-react")).Emoji, {
   loading: () => <LoadingIcon />,
 });
-
-function useSubmitHandler() {
-  const config = useChatStore((state) => state.config);
-  const submitKey = config.submitKey;
-
-  const shouldSubmit = (e: KeyboardEvent) => {
-    if (e.key !== "Enter") return false;
-
-    return (
-      (config.submitKey === SubmitKey.AltEnter && e.altKey) ||
-      (config.submitKey === SubmitKey.CtrlEnter && e.ctrlKey) ||
-      (config.submitKey === SubmitKey.ShiftEnter && e.shiftKey) ||
-      (config.submitKey === SubmitKey.Enter &&
-        !e.altKey &&
-        !e.ctrlKey &&
-        !e.shiftKey)
-    );
-  };
-
-  return {
-    submitKey,
-    shouldSubmit,
-  };
-}
-
-function useSwitchTheme() {
-  const config = useChatStore((state) => state.config);
-
-  useEffect(() => {
-    document.body.classList.remove("light");
-    document.body.classList.remove("dark");
-    if (config.theme === "dark") {
-      document.body.classList.add("dark");
-    } else if (config.theme === "light") {
-      document.body.classList.add("light");
-    }
-
-    const themeColor = getComputedStyle(document.body)
-      .getPropertyValue("--theme-color")
-      .trim();
-    const metaDescription = document.querySelector('meta[name="theme-color"]');
-    metaDescription?.setAttribute("content", themeColor);
-  }, [config.theme]);
-}
-
-function exportMessages(messages: Message[], topic: string) {
-  const mdText =
-    `# ${topic}\n\n` +
-    messages
-      .map((m) => {
-        return m.role === "user" ? `## ${m.content}` : m.content.trim();
-      })
-      .join("\n\n");
-  const filename = `${topic}.md`;
-
-  showModal({
-    title: Locale.Export.Title,
-    children: (
-      <div className="markdown-body">
-        <pre className={styles["export-content"]}>{mdText}</pre>
-      </div>
-    ),
-    actions: [
-      <IconButton
-        key="copy"
-        icon={<CopyIcon />}
-        bordered
-        text={Locale.Export.Copy}
-        onClick={() => copyToClipboard(mdText)}
-      />,
-      <IconButton
-        key="download"
-        icon={<DownloadIcon />}
-        bordered
-        text={Locale.Export.Download}
-        onClick={() => downloadAs(mdText, filename)}
-      />,
-    ],
-  });
-}
-
-function showMemoryPrompt(session: ChatSession) {
-  showModal({
-    title: `${Locale.Memory.Title} (${session.lastSummarizeIndex} of ${session.messages.length})`,
-    children: (
-      <div className="markdown-body">
-        <pre className={styles["export-content"]}>
-          {session.memoryPrompt || Locale.Memory.EmptyContent}
-        </pre>
-      </div>
-    ),
-    actions: [
-      <IconButton
-        key="copy"
-        icon={<CopyIcon />}
-        bordered
-        text={Locale.Memory.Copy}
-        onClick={() => copyToClipboard(session.memoryPrompt)}
-      />,
-    ],
-  });
-}
 
 export function Avatar(props: { role: Message["role"] }) {
   const config = useChatStore((state) => state.config);
@@ -230,33 +123,133 @@ export function ChatList() {
   );
 }
 
-export function Chat(props: { showSideBar?: () => void }) {
-  let autoScrolling = true;
-  const eventTypes = ["wheel", "touchmove", "keydown"];
+function useSubmitHandler() {
+  const config = useChatStore((state) => state.config);
+  const submitKey = config.submitKey;
+
+  const shouldSubmit = (e: KeyboardEvent) => {
+    if (e.key !== "Enter") return false;
+
+    return (
+      (config.submitKey === SubmitKey.AltEnter && e.altKey) ||
+      (config.submitKey === SubmitKey.CtrlEnter && e.ctrlKey) ||
+      (config.submitKey === SubmitKey.ShiftEnter && e.shiftKey) ||
+      (config.submitKey === SubmitKey.MetaEnter && e.metaKey) ||
+      (config.submitKey === SubmitKey.Enter &&
+        !e.altKey &&
+        !e.ctrlKey &&
+        !e.shiftKey &&
+        !e.metaKey)
+    );
+  };
+
+  return {
+    submitKey,
+    shouldSubmit,
+  };
+}
+
+export function PromptHints(props: {
+  prompts: Prompt[];
+  onPromptSelect: (prompt: Prompt) => void;
+}) {
+  if (props.prompts.length === 0) return null;
+
+  return (
+    <div className={styles["prompt-hints"]}>
+      {props.prompts.map((prompt, i) => (
+        <div
+          className={styles["prompt-hint"]}
+          key={prompt.title + i.toString()}
+          onClick={() => props.onPromptSelect(prompt)}>
+          <div className={styles["hint-title"]}>{prompt.title}</div>
+          <div className={styles["hint-content"]}>{prompt.content}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+export function Chat(props: {
+  showSideBar?: () => void;
+  sideBarShowing?: boolean;
+}) {
+  type RenderMessage = Message & { preview?: boolean };
+
+  const chatStore = useChatStore();
   const [session, sessionIndex] = useChatStore((state) => [
     state.currentSession(),
     state.currentSessionIndex,
   ]);
+  const fontSize = useChatStore((state) => state.config.fontSize);
+
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   const [userInput, setUserInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const { submitKey, shouldSubmit } = useSubmitHandler();
 
-  const onUserInput = useChatStore((state) => state.onUserInput);
+  // prompt hints
+  const promptStore = usePromptStore();
+  const [promptHints, setPromptHints] = useState<Prompt[]>([]);
+  const onSearch = useDebouncedCallback(
+    (text: string) => {
+      setPromptHints(promptStore.search(text));
+    },
+    100,
+    { leading: true, trailing: true }
+  );
 
+  const onPromptSelect = (prompt: Prompt) => {
+    setUserInput(prompt.content);
+    setPromptHints([]);
+    inputRef.current?.focus();
+  };
+
+  const scrollInput = () => {
+    const dom = inputRef.current;
+    if (!dom) return;
+    const paddingBottomNum: number = parseInt(
+      window.getComputedStyle(dom).paddingBottom,
+      10
+    );
+    dom.scrollTop = dom.scrollHeight - dom.offsetHeight + paddingBottomNum;
+  };
+
+  // only search prompts when user input is short
+  const SEARCH_TEXT_LIMIT = 30;
+  const onInput = (text: string) => {
+    scrollInput();
+    setUserInput(text);
+    const n = text.trim().length;
+
+    // clear search results
+    if (n === 0) {
+      setPromptHints([]);
+    } else if (!chatStore.config.disablePromptHint && n < SEARCH_TEXT_LIMIT) {
+      // check if need to trigger auto completion
+      if (text.startsWith("/") && text.length > 1) {
+        onSearch(text.slice(1));
+      }
+    }
+  };
+
+  // submit user input
   const onUserSubmit = () => {
     if (userInput.length <= 0) return;
-
-    autoScrolling = true;
-    startAutoScroll();
     setIsLoading(true);
-    onUserInput(userInput).then(() => setIsLoading(false));
+    chatStore.onUserInput(userInput).then(() => setIsLoading(false));
     setUserInput("");
+    setPromptHints([]);
+    inputRef.current?.focus();
   };
+
+  // stop response
   const onUserStop = (messageIndex: number) => {
-    // console.log(ControllerPool, sessionIndex, messageIndex);
+    console.log(ControllerPool, sessionIndex, messageIndex);
     ControllerPool.stop(sessionIndex, messageIndex);
   };
 
+  // check if should send message
   const onInputKeyDown = (e: KeyboardEvent) => {
     if (shouldSubmit(e)) {
       onUserSubmit();
@@ -280,45 +273,22 @@ export function Chat(props: { showSideBar?: () => void }) {
     for (let i = botIndex; i >= 0; i -= 1) {
       if (messages[i].role === "user") {
         setIsLoading(true);
-        onUserInput(messages[i].content).then(() => setIsLoading(false));
+        chatStore
+          .onUserInput(messages[i].content)
+          .then(() => setIsLoading(false));
+        inputRef.current?.focus();
         return;
       }
     }
   };
 
-  const startAutoScroll = throttle(
-    () => {
-      if (autoScrolling) {
-        const dom = latestMessageRef.current;
-        if (dom && !isIOS() && !hoveringMessage) {
-          dom.scrollIntoView({
-            behavior: "smooth",
-            block: "end",
-          });
-        }
-      }
-    },
-    250,
-    { leading: true, trailing: false }
-  );
-  const stopAutoScroll = () => {
-    if (isLoading) {
-      autoScrolling = false;
-    }
-  };
-  const eventHandler = (e: any) => {
-    if (e.type === "keydown") {
-      if (e.key !== "ArrowUp" && e.key !== "ArrowDown") {
-        return;
-      }
-    }
-    stopAutoScroll();
-  };
-
+  // for auto-scroll
   const latestMessageRef = useRef<HTMLDivElement>(null);
 
-  const [hoveringMessage, setHoveringMessage] = useState(false);
+  // wont scroll while hovering messages
+  const [autoScroll, setAutoScroll] = useState(false);
 
+  // preview messages
   const messages = (session.messages as RenderMessage[])
     .concat(
       isLoading
@@ -345,11 +315,16 @@ export function Chat(props: { showSideBar?: () => void }) {
         : []
     );
 
+  // auto scroll
   useLayoutEffect(() => {
-    eventTypes.forEach((type) => {
-      window.addEventListener(type, eventHandler, { passive: false });
-    });
-    startAutoScroll();
+    setTimeout(() => {
+      const dom = latestMessageRef.current;
+      if (dom && !isIOS() && autoScroll) {
+        dom.scrollIntoView({
+          block: "end",
+        });
+      }
+    }, 500);
   });
 
   return (
@@ -358,7 +333,16 @@ export function Chat(props: { showSideBar?: () => void }) {
         <div
           className={styles["window-header-title"]}
           onClick={props?.showSideBar}>
-          <div className={styles["window-header-main-title"]}>
+          <div
+            className={`${styles["window-header-main-title"]} ${styles["chat-body-title"]}`}
+            onClick={() => {
+              const newTopic = prompt(Locale.Chat.Rename, session.topic);
+              if (newTopic && newTopic !== session.topic) {
+                chatStore.updateCurrentSession(
+                  (session) => (session.topic = newTopic!)
+                );
+              }
+            }}>
             {session.topic}
           </div>
           <div className={styles["window-header-sub-title"]}>
@@ -451,7 +435,11 @@ export function Chat(props: { showSideBar?: () => void }) {
                   ) : (
                     <div
                       className="markdown-body"
-                      onContextMenu={(e) => onRightClick(e, message)}>
+                      style={{ fontSize: `${fontSize}px` }}
+                      onContextMenu={(e) => onRightClick(e, message)}
+                      onDoubleClickCapture={() =>
+                        setUserInput(message.content)
+                      }>
                       <Markdown content={message.content} />
                     </div>
                   )}
@@ -467,22 +455,29 @@ export function Chat(props: { showSideBar?: () => void }) {
             </div>
           );
         })}
-        <div ref={latestMessageRef} style={{ opacity: 0, height: "2em" }}>
+        <div ref={latestMessageRef} style={{ opacity: 0, height: "4em" }}>
           -
         </div>
       </div>
 
       <div className={styles["chat-input-panel"]}>
+        <PromptHints prompts={promptHints} onPromptSelect={onPromptSelect} />
         <div className={styles["chat-input-panel-inner"]}>
           <textarea
+            ref={inputRef}
             className={styles["chat-input"]}
             placeholder={Locale.Chat.Input(submitKey)}
-            rows={3}
-            onInput={(e) => setUserInput(e.currentTarget.value)}
+            rows={4}
+            onInput={(e) => onInput(e.currentTarget.value)}
             value={userInput}
             onKeyDown={(e) => onInputKeyDown(e as any)}
+            onFocus={() => setAutoScroll(true)}
+            onBlur={() => {
+              setAutoScroll(false);
+              setTimeout(() => setPromptHints([]), 100);
+            }}
+            autoFocus={!props?.sideBarShowing}
           />
-
           <IconButton
             icon={<SendWhiteIcon />}
             className={styles["chat-input-send"] + " no-dark"}
@@ -494,6 +489,95 @@ export function Chat(props: { showSideBar?: () => void }) {
   );
 }
 
+function useSwitchTheme() {
+  const config = useChatStore((state) => state.config);
+
+  useEffect(() => {
+    document.body.classList.remove("light");
+    document.body.classList.remove("dark");
+
+    if (config.theme === "dark") {
+      document.body.classList.add("dark");
+    } else if (config.theme === "light") {
+      document.body.classList.add("light");
+    }
+
+    const themeColor = getComputedStyle(document.body)
+      .getPropertyValue("--theme-color")
+      .trim();
+    const metaDescription = document.querySelector('meta[name="theme-color"]');
+    metaDescription?.setAttribute("content", themeColor);
+  }, [config.theme]);
+}
+
+function exportMessages(messages: Message[], topic: string) {
+  const mdText =
+    `# ${topic}\n\n` +
+    messages
+      .map((m) => {
+        return m.role === "user" ? `## ${m.content}` : m.content.trim();
+      })
+      .join("\n\n");
+  const filename = `${topic}.md`;
+
+  showModal({
+    title: Locale.Export.Title,
+    children: (
+      <div className="markdown-body">
+        <pre className={styles["export-content"]}>{mdText}</pre>
+      </div>
+    ),
+    actions: [
+      <IconButton
+        key="copy"
+        icon={<CopyIcon />}
+        bordered
+        text={Locale.Export.Copy}
+        onClick={() => copyToClipboard(mdText)}
+      />,
+      <IconButton
+        key="download"
+        icon={<DownloadIcon />}
+        bordered
+        text={Locale.Export.Download}
+        onClick={() => downloadAs(mdText, filename)}
+      />,
+    ],
+  });
+}
+
+function showMemoryPrompt(session: ChatSession) {
+  showModal({
+    title: `${Locale.Memory.Title} (${session.lastSummarizeIndex} of ${session.messages.length})`,
+    children: (
+      <div className="markdown-body">
+        <pre className={styles["export-content"]}>
+          {session.memoryPrompt || Locale.Memory.EmptyContent}
+        </pre>
+      </div>
+    ),
+    actions: [
+      <IconButton
+        key="copy"
+        icon={<CopyIcon />}
+        bordered
+        text={Locale.Memory.Copy}
+        onClick={() => copyToClipboard(session.memoryPrompt)}
+      />,
+    ],
+  });
+}
+
+const useHasHydrated = () => {
+  const [hasHydrated, setHasHydrated] = useState<boolean>(false);
+
+  useEffect(() => {
+    setHasHydrated(true);
+  }, []);
+
+  return hasHydrated;
+};
+
 export function Home() {
   const [createNewSession, currentIndex, removeSession] = useChatStore(
     (state) => [
@@ -502,7 +586,7 @@ export function Home() {
       state.removeSession,
     ]
   );
-  const loading = !useChatStore?.persist?.hasHydrated();
+  const loading = !useHasHydrated();
   const [showSideBar, setShowSideBar] = useState(true);
 
   // setting
@@ -518,7 +602,7 @@ export function Home() {
   return (
     <div
       className={`${
-        config.fullScreen ? styles["tight-container"] : styles.container
+        config.tightBorder ? styles["tight-container"] : styles.container
       }`}>
       <div
         className={
@@ -542,6 +626,7 @@ export function Home() {
           <ChatList />
         </div>
 
+        <Recomment />
         <div className={styles["sidebar-tail"]}>
           <div className={styles["sidebar-actions"]}>
             <div className={styles["sidebar-action"] + " " + styles.mobile}>
@@ -554,7 +639,7 @@ export function Home() {
                 }}
               />
             </div>
-            <div className={styles["sidebar-action"]} title="设置">
+            <div className={styles["sidebar-action"]}>
               <IconButton
                 icon={<SettingsIcon />}
                 onClick={() => {
@@ -563,7 +648,7 @@ export function Home() {
                 }}
               />
             </div>
-            <div className={styles["sidebar-action"]} title="源码">
+            <div className={styles["sidebar-action"]}>
               <a href={REPO_URL} target="_blank">
                 <IconButton icon={<GithubIcon />} />
               </a>
@@ -578,7 +663,13 @@ export function Home() {
             </div>
           </div>
           <div>
-            <IconButton icon={<AddIcon />} onClick={createNewSession} />
+            <IconButton
+              icon={<AddIcon />}
+              onClick={() => {
+                createNewSession();
+                setShowSideBar(false);
+              }}
+            />
           </div>
         </div>
         <div className={styles["sidebar-links"]}>
@@ -602,7 +693,11 @@ export function Home() {
             }}
           />
         ) : (
-          <Chat key="chat" showSideBar={() => setShowSideBar(true)} />
+          <Chat
+            key="chat"
+            showSideBar={() => setShowSideBar(true)}
+            sideBarShowing={showSideBar}
+          />
         )}
       </div>
     </div>
